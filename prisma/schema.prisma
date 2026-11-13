@@ -1,0 +1,236 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Hosts (supply side) ----------
+
+model Host {
+  id              String   @id @default(cuid())
+  email           String   @unique
+  passwordHash    String
+  name            String
+  // Stripe Connect Express
+  stripeAccountId String?  @unique
+  stripeOnboarded Boolean  @default(false)
+  // Optional email for cleaner/staff fulfillment alerts
+  staffAlertEmail String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  listings        Listing[]
+  upsells         Upsell[]
+  orders          Order[]
+  pmsConnections  PmsConnection[]
+  messageTriggers MessageTrigger[]
+}
+
+enum PmsProvider {
+  HOSPITABLE
+  HOSTAWAY
+}
+
+model PmsConnection {
+  id        String      @id @default(cuid())
+  hostId    String
+  host      Host        @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  provider  PmsProvider
+  // API key / access token for the PMS (Hospitable PAT, Hostaway client credentials)
+  apiKey    String
+  accountId String? // Hostaway account id (used as client_id)
+  createdAt DateTime    @default(now())
+  lastSync  DateTime?
+
+  @@unique([hostId, provider])
+}
+
+// ---------- Listings & reservations ----------
+
+enum ReservationSource {
+  ICAL
+  HOSPITABLE
+  HOSTAWAY
+  MANUAL
+}
+
+model Listing {
+  id           String  @id @default(cuid())
+  hostId       String
+  host         Host    @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  name         String
+  address      String?
+  photoUrl     String?
+  // Airbnb iCal export URL (fallback sync path for non-PMS hosts)
+  icalUrl      String?
+  // PMS-side listing/property id when synced via Hospitable/Hostaway
+  pmsProvider  PmsProvider?
+  pmsListingId String?
+  timezone     String  @default("UTC")
+  active       Boolean @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  reservations Reservation[]
+  upsells      Upsell[]
+
+  @@index([hostId])
+}
+
+model Reservation {
+  id              String            @id @default(cuid())
+  listingId       String
+  listing         Listing           @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  source          ReservationSource @default(MANUAL)
+  // UID from iCal feed or reservation id from the PMS — used for idempotent upserts
+  externalId      String?
+  guestName       String?
+  guestEmail      String?
+  guestPhone      String?
+  checkIn         DateTime
+  checkOut        DateTime
+  guestCount      Int               @default(1)
+  // Unguessable token powering the guest storefront URL (/s/[token])
+  storefrontToken String            @unique
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  orders      Order[]
+  messageLogs MessageLog[]
+
+  @@unique([listingId, externalId])
+  @@index([listingId, checkIn])
+}
+
+// ---------- Upsells ----------
+
+enum UpsellCategory {
+  ROOM_UPGRADE
+  EARLY_CHECKIN
+  LATE_CHECKOUT
+  AMENITY
+  EXPERIENCE
+  OTHER
+}
+
+enum PricingType {
+  FLAT
+  PER_NIGHT
+  PER_GUEST
+}
+
+model Upsell {
+  id          String         @id @default(cuid())
+  hostId      String
+  host        Host           @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  // null listingId = global upsell offered across all of the host's listings
+  listingId   String?
+  listing     Listing?       @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  photoUrl    String?
+  category    UpsellCategory @default(OTHER)
+  pricingType PricingType    @default(FLAT)
+  priceCents  Int
+  currency    String         @default("usd")
+  // Inventory cap per day (e.g. max 1 kayak/day). Null = unlimited.
+  maxPerDay   Int?
+  // Disable purchase within N hours of check-in. Null = always purchasable.
+  leadTimeCutoffHours Int?
+  active      Boolean        @default(true)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  orderItems OrderItem[]
+
+  @@index([hostId])
+  @@index([listingId])
+}
+
+// ---------- Orders & payments ----------
+
+enum OrderStatus {
+  PENDING
+  PAID
+  REFUNDED
+  FAILED
+  CANCELED
+}
+
+model Order {
+  id                    String      @id @default(cuid())
+  reservationId         String
+  reservation           Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  hostId                String
+  host                  Host        @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  status                OrderStatus @default(PENDING)
+  subtotalCents         Int
+  applicationFeeCents   Int
+  currency              String      @default("usd")
+  stripePaymentIntentId String?     @unique
+  guestEmail            String?
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+
+  items OrderItem[]
+
+  @@index([hostId, status])
+}
+
+model OrderItem {
+  id             String  @id @default(cuid())
+  orderId        String
+  order          Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  upsellId       String
+  upsell         Upsell  @relation(fields: [upsellId], references: [id])
+  // Snapshots so order history survives upsell edits
+  title          String
+  pricingType    PricingType
+  unitPriceCents Int
+  quantity       Int     @default(1)
+  totalCents     Int
+}
+
+// ---------- Automated messaging ----------
+
+enum TriggerType {
+  BOOKING_CONFIRMED
+  PRE_CHECKIN_72H
+  CHECKOUT_MORNING
+}
+
+enum MessageChannel {
+  EMAIL
+  SMS
+  PMS
+}
+
+model MessageTrigger {
+  id        String         @id @default(cuid())
+  hostId    String
+  host      Host           @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  type      TriggerType
+  channel   MessageChannel @default(EMAIL)
+  enabled   Boolean        @default(true)
+  // Optional custom template. Supports {{guest_name}}, {{listing_name}}, {{storefront_url}}
+  template  String?
+  createdAt DateTime       @default(now())
+
+  @@unique([hostId, type, channel])
+}
+
+model MessageLog {
+  id            String         @id @default(cuid())
+  reservationId String
+  reservation   Reservation    @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  triggerType   TriggerType
+  channel       MessageChannel
+  status        String         @default("sent")
+  detail        String?
+  sentAt        DateTime       @default(now())
+
+  @@unique([reservationId, triggerType, channel])
+}
